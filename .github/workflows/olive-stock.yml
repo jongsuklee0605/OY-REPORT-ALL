@@ -50,7 +50,7 @@ jobs:
         env:
           MODE: stock
           SHARD: ${{ matrix.shard }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_STOCK }}
           GOODS_NO_ALL: ${{ secrets.GOODS_NO }}
         run: |
           export GOODS_NO=$(python -c "
