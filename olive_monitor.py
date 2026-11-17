@@ -8,8 +8,10 @@ MODE=rank  : 랭킹 페이지에서 상품 순위 체크
   SLACK_WEBHOOK_URL  (필수) 슬랙 Incoming Webhook 주소
   GOODS_NO           (필수) 상품번호, 쉼표로 여러 개
   RANK_URLS          (선택) 랭킹 페이지, "이름|URL" 을 쉼표로 여러 개. 안 넣으면 전체 랭킹만
-  ALWAYS_NOTIFY      (선택) 1이면 변화 없어도 매번 상세 알림
+  ALWAYS_NOTIFY      (선택) 1이면 변화 없어도 매번 상품별 요약 알림
   NOTIFY_NO_CHANGE   (선택) 0이면 '변경점 없음' 알림을 보내지 않음 (기본 1)
+  SUMMARY_FILE       (선택) 재고 모드에서 지정하면 '변경점 없음'은 보내지 않고 이 파일에 결과를 기록
+                            (여러 묶음을 합쳐 한 번에 보내는 통합 job 용)
 """
 import json
 import os
@@ -29,6 +31,7 @@ RAW_GOODS = os.environ.get("GOODS_NO", "")
 GOODS = list(dict.fromkeys(g.strip() for g in RAW_GOODS.split(",") if g.strip()))
 ALWAYS = os.environ.get("ALWAYS_NOTIFY") == "1"
 NOTIFY_NO_CHANGE = os.environ.get("NOTIFY_NO_CHANGE", "1") != "0"
+SUMMARY_FILE = os.environ.get("SUMMARY_FILE", "").strip()
 
 DEFAULT_RANK = "전체|https://www.oliveyoung.co.kr/store/main/getBestList.do"
 MAIN_URL = "https://www.oliveyoung.co.kr/store/main/main.do"
@@ -41,6 +44,9 @@ NAV_TIMEOUT = 25000      # 페이지 하나를 여는 데 기다리는 최대 �
 TIME_LIMIT = 9 * 60      # 전체 실행 최대 시간(초)
 MAX_CONSEC_FAIL = 4      # 연속 실패가 이만큼이면 접속 차단으로 보고 중단
 RANK_RETRY = 3           # 랭킹 페이지 최대 시도 횟수
+RETRY_429 = 2            # 429가 뜨면 같은 상품을 최대 몇 번 다시 시도할지
+WAIT_429 = (20, 40)      # 429가 떴을 때 기다리는 시간 범위(초)
+GAP = (1.0, 2.0)         # 평소 상품 사이 대기 시간 범위(초)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 STEALTH_JS = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); Object.defineProperty(navigator, 'languages', {get: () => ['ko-KR', 'ko', 'en-US']}); window.chrome = {runtime: {}};"
@@ -208,6 +214,7 @@ def run_rank(page, prev):
     old_items = prev["items"]
 
     now_items, blocks = {}, []
+    rank_changed = False
     for g in GOODS:
         old = old_items.get(g, {})
         old_ranks = old.get("ranks", {})
@@ -219,8 +226,10 @@ def run_rank(page, prev):
                 ranks[name] = r
                 if g in old_items and old_ranks.get(name) != r:
                     diffs.append(f"  · {name}: {rank_text(old_ranks.get(name))} → *{rank_text(r)}*")
+                    rank_changed = True
                 elif g not in old_items and r:
                     diffs.append(f"  · {name}: *{rank_text(r)}*")
+                    rank_changed = True
                 elif ALWAYS:
                     diffs.append(f"  · {name}: {rank_text(r)}")
             else:
@@ -244,12 +253,20 @@ def run_rank(page, prev):
         blocks.append("\n".join(err_lines))
 
     ts = now_ts()
-    if blocks:
+    if rank_changed or err_lines:
         send_slack(f"📊 [올리브영 랭킹 {ts}] 순위 변동", blocks)
-    elif NOTIFY_NO_CHANGE:
+    elif ALWAYS or NOTIFY_NO_CHANGE:
         in_rank = sum(1 for v in now_items.values() if any(v["ranks"].values()))
         note = f" (확인 실패 중: {', '.join(fails)})" if fails else ""
-        post_slack(f"✅ [올리브영 랭킹 {ts}] 순위 변동 없음. 랭킹 내 상품 {in_rank}개{note}")
+        msg = f"✅ [올리브영 랭킹 {ts}] 순위 변동 없음. 랭킹 내 상품 {in_rank}개{note}"
+        if ALWAYS:
+            lines = []
+            for g in GOODS:
+                it = now_items[g]
+                rs = ", ".join(f"{n} {rank_text(r)}" for n, r in it["ranks"].items())
+                lines.append(f"· {it['name'] or g}: {rs}")
+            msg += "\n" + "\n".join(lines)
+        post_slack(msg)
     else:
         log("변화 없음 (알림 생략)")
 
@@ -363,9 +380,33 @@ def stock_label(so):
     return "확인 못함" if so is None else ("🔴 품절" if so else "🟢 판매중")
 
 
+def describe_stock(s, g):
+    if s["options"]:
+        desc = ", ".join(f"{n}({'품절' if v else '판매중'})" for n, v in s["options"].items())
+        return f"{s['name']} ({g}) 옵션 {len(s['options'])}개: {desc}"
+    return f"{s['name']} ({g}) {'품절' if s['soldout'] else '판매중'} (옵션 없음)"
+
+
+def get_stock_with_429_retry(page, g, label):
+    """429가 뜨면 잠깐 기다렸다가 같은 상품을 다시 시도. 다른 오류는 그대로 올려보냄."""
+    for attempt in range(RETRY_429 + 1):
+        try:
+            return get_stock(page, g)
+        except NoStockInfo:
+            raise
+        except Exception as e:
+            is_429 = "HTTP 429" in str(e)
+            if not is_429 or attempt >= RETRY_429 or time.time() - T0 > TIME_LIMIT:
+                raise
+            wait = random.uniform(*WAIT_429)
+            log(f"{label} {g} 요청 제한(429) → {wait:.0f}초 후 다시 시도 ({attempt + 1}/{RETRY_429})")
+            time.sleep(wait)
+
+
 def run_stock(page, prev):
     log(f"[재고 모드] 상품 {len(GOODS)}개")
     stock, fails = {}, {}
+    no_info = set()
     consec_fail = 0
     stopped = None
 
@@ -376,28 +417,44 @@ def run_stock(page, prev):
         if consec_fail >= MAX_CONSEC_FAIL:
             stopped = f"연속 {consec_fail}회 실패 → 접속 차단 의심 ({i - 1}/{len(GOODS)}개 확인 후 중단)"
             break
+        label = f"[{i}/{len(GOODS)}]"
         try:
-            stock[g] = get_stock(page, g)
+            stock[g] = get_stock_with_429_retry(page, g, label)
             consec_fail = 0
-            s = stock[g]
-            if s["options"]:
-                desc = ", ".join(f"{n}({'품절' if v else '판매중'})" for n, v in s["options"].items())
-                log(f"[{i}/{len(GOODS)}] {s['name']} ({g}) 옵션 {len(s['options'])}개: {desc}")
-            else:
-                log(f"[{i}/{len(GOODS)}] {s['name']} ({g}) {'품절' if s['soldout'] else '판매중'} (옵션 없음)")
+            log(f"{label} {describe_stock(stock[g], g)}")
         except NoStockInfo as e:
             consec_fail = 0
+            no_info.add(g)
             fails[g] = str(e)[:100]
-            log(f"[{i}/{len(GOODS)}] {g} 판단 불가: {str(e)[:100]}")
+            log(f"{label} {g} 판단 불가: {str(e)[:100]}")
         except Exception as e:
             consec_fail += 1
             fails[g] = str(e)[:100]
-            log(f"[{i}/{len(GOODS)}] {g} 실패: {str(e)[:100]}")
-        time.sleep(random.uniform(0.5, 1.2))
+            log(f"{label} {g} 실패: {str(e)[:100]}")
+        time.sleep(random.uniform(*GAP))
+
+    # ---------- 실패한 상품 마지막에 한 번 더 시도 ----------
+    retry = [g for g in GOODS if g in fails and g not in no_info]
+    if retry and not stopped:
+        log(f"실패 상품 {len(retry)}개 재시도")
+        time.sleep(random.uniform(3, 5))
+        for g in retry:
+            if time.time() - T0 > TIME_LIMIT:
+                log("재시도 중 시간 제한 → 재시도 중단")
+                break
+            try:
+                stock[g] = get_stock_with_429_retry(page, g, "[재시도]")
+                fails.pop(g, None)
+                log(f"[재시도 성공] {describe_stock(stock[g], g)}")
+            except Exception as e:
+                fails[g] = str(e)[:100]
+                log(f"[재시도 실패] {g}: {str(e)[:100]}")
+            time.sleep(random.uniform(*GAP))
 
     old_items = prev["items"]
     prev_errors = prev["errors"]
     now_items, now_errors, blocks = {}, {}, []
+    changed_cnt = 0
 
     for g in GOODS:
         old = old_items.get(g, {})
@@ -413,6 +470,8 @@ def run_stock(page, prev):
         now_items[g] = cur
 
         changed = (old.get("soldout"), old.get("options", {})) != (cur["soldout"], cur["options"])
+        if changed and g in stock:
+            changed_cnt += 1
         if not (changed or ALWAYS) or g not in stock:
             continue
         tag = "⚠️ 변화 " if changed and g in old_items else ""
@@ -447,11 +506,34 @@ def run_stock(page, prev):
         extra = f"\n...외 {len(err_lines) - 10}건" if len(err_lines) > 10 else ""
         blocks.append("❗ 확인 실패/중단 (이전 값 유지)\n" + "\n".join(shown) + extra)
 
+    has_issue = bool(changed_cnt or err_lines)
+
+    # ALWAYS_NOTIFY=1이면 변화가 없어도 상품별 한 줄 요약을 붙임
+    summary_lines = []
+    if ALWAYS:
+        for g in GOODS:
+            if g not in stock:
+                continue
+            it = now_items[g]
+            opts = it["options"] or {}
+            extra = f" (옵션 {len(opts)}개 중 {sum(opts.values())}개 품절)" if opts else ""
+            summary_lines.append(f"· {it['name'] or g}: {stock_label(it['soldout'])}{extra}")
+
+    if SUMMARY_FILE:
+        Path(SUMMARY_FILE).write_text(json.dumps(
+            {"goods": len(GOODS), "checked": len(stock), "issue": has_issue, "lines": summary_lines},
+            ensure_ascii=False))
+
     ts = now_ts()
-    if blocks:
+    if has_issue:
         send_slack(f"📦 [올리브영 재고 {ts}] 상품 {len(GOODS)}개 확인", blocks)
-    elif NOTIFY_NO_CHANGE:
-        post_slack(f"✅ [올리브영 재고 {ts}] 상품 {len(GOODS)}개 체크했으나 변경점이 없습니다. (재고 확인 {len(stock)}개)")
+    elif SUMMARY_FILE:
+        log("변화 없음 → 통합 알림 job에서 한 번에 전송")
+    elif ALWAYS or NOTIFY_NO_CHANGE:
+        msg = f"✅ [올리브영 재고 {ts}] 상품 {len(GOODS)}개 체크했으나 변경점이 없습니다. (재고 확인 {len(stock)}개)"
+        if summary_lines:
+            msg += "\n" + "\n".join(summary_lines)
+        post_slack(msg)
     else:
         log("변화 없음 (알림 생략)")
 
